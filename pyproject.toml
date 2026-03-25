@@ -1,0 +1,16 @@
+[project]
+name = "swe-opd-modal-teacher"
+version = "0.1.0"
+description = "Standalone Modal deployment for a fixed-size remote SGLang teacher service."
+requires-python = ">=3.11"
+dependencies = [
+  "modal>=0.74",
+  "requests>=2.32.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["swe_opd_modal_teacher"]
