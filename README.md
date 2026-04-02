@@ -1,517 +1,309 @@
 # swe-opd-modal-teacher
 
-Standalone Modal deployment for a fixed-size remote SGLang teacher service.
+Deploy a fixed-size remote SGLang teacher service on [Modal](https://modal.com) for on-policy distillation (OPD). This repo is part of the [swe-opt-training](https://github.com/twelfth-star/swe-opt-training) pipeline.
 
-This repo is intentionally separate from the A/B rollout bootstrap in `swe-opd`.
-Its job is only:
+The service:
+- keeps exactly `N` Modal replicas alive (`min_containers = max_containers = N`)
+- gives each replica exactly `M` GPUs
+- runs one SGLang server per replica with `--tp M`
+- exposes a stable public endpoint that accepts `input_ids` and returns token-level log-probabilities
 
-- keep exactly `n` Modal replicas alive
-- give each replica exactly `m` GPUs
-- run one SGLang server per replica with `TP=m`
-- expose a stable remote teacher endpoint for OPD-style logprob queries
+Related repos:
+- [swe-opt-training](https://github.com/twelfth-star/swe-opt-training) — OPD training loop (calls this teacher)
+- [swe-opd-remote-docker](https://github.com/twelfth-star/swe-opd-remote-docker) — distributed rollout infrastructure
 
-The intended deployment model is:
+## Quick Start
 
-- total GPUs: `m * n`
-- tensor parallel per replica: `m`
-- data-parallel replicas: `n` Modal containers
-- no autoscaling beyond the fixed `n` replicas
-
-## Layout
-
-- `modal_app.py`: Modal app entrypoint
-- `swe_opd_modal_teacher/settings.py`: environment-backed configuration
-- `swe_opd_modal_teacher/runtime.py`: runtime helpers
-- `config/bootstrap/modal_teacher.example.env`: example local config
-- `scripts/status.sh`: print the current local config summary
-- `scripts/prefetch_model.sh`: prefetch model weights into the shared Modal volume
-- `scripts/deploy.sh`: deploy the fixed-size teacher service
-- `scripts/test_health.sh`: authenticated readiness smoke test
-- `scripts/test_generate.sh`: send a minimal text-based `/generate` request
-- `scripts/test_generate_input_ids.sh`: send an OPD-style `input_ids` request
-
-## What This Service Actually Runs
-
-This repo implements the following topology:
-
-1. Modal keeps exactly `n` replicas alive by setting `min_containers=max_containers=n`.
-2. Each replica requests exactly `m` GPUs via `MODAL_GPU_CONFIG`.
-3. Each replica launches one SGLang process with `--tp m`.
-4. All replicas serve the same model and tokenizer.
-5. The exposed endpoint is used as a remote teacher service for OPD.
-
-For the intended topology:
-
-- `SGLANG_TP_SIZE` should equal the GPU count in `MODAL_GPU_CONFIG`
-- `MODAL_DP_REPLICAS`, `MODAL_MIN_CONTAINERS`, and `MODAL_MAX_CONTAINERS` should all be the same value
-
-Example:
-
-- `m = 2`
-- `n = 3`
-
-Then:
-
-- total GPUs = `6`
-- each Modal replica gets `2` GPUs
-- each replica runs `sglang.launch_server --tp 2`
-- Modal keeps exactly `3` replicas alive
-
-## Prerequisites
-
-You need:
-
-- a Modal account and working local CLI login
-- a Python environment with `modal` available locally
-- access to the target Hugging Face model
-- a Modal secret for Hugging Face if the model is private
-
-Local setup:
+### 1. Install prerequisites
 
 ```bash
-cd /u/zhe3/re-swe/swe-opd-modal-teacher
 pip install -e .
 pip install modal
-modal setup
+modal setup   # authenticate with your Modal account
 ```
 
-If the teacher model is private on Hugging Face, create a Modal secret first and then reference it with `MODAL_HF_SECRET_NAME`.
+Each team member needs their own Modal account. Sign up at https://modal.com if you don't have one.
 
-## Configuration
-
-Create your local env file:
+### 2. Run the setup wizard
 
 ```bash
-cd /u/zhe3/re-swe/swe-opd-modal-teacher
-cp config/bootstrap/modal_teacher.example.env config/bootstrap/modal_teacher.local.env
+bash scripts/setup.sh
 ```
 
-You can inspect the currently loaded values with:
+This creates `config/bootstrap/modal_teacher.local.env` (gitignored) with your settings. The wizard prompts for model path, GPU topology, API key, etc.
+
+To check if config already exists:
 
 ```bash
-bash scripts/status.sh
+bash scripts/setup.sh --check
 ```
 
-The most important config fields are:
+### 3. Prefetch model weights
 
-- `MODAL_APP_NAME`: Modal app name
-- `MODAL_REGION`: region where the teacher containers run
-- `MODAL_PROXY_REGIONS`: proxy region for the public endpoint
-- `MODAL_GPU_CONFIG`: GPUs per replica, for example `A100:2`
-- `MODAL_DP_REPLICAS`: fixed replica count
-- `MODAL_MIN_CONTAINERS`: should equal `MODAL_DP_REPLICAS`
-- `MODAL_MAX_CONTAINERS`: should equal `MODAL_DP_REPLICAS`
-- `SGLANG_MODEL_PATH`: teacher model path or HF repo id
-- `SGLANG_MODEL_REVISION`: optional pinned model revision
-- `SGLANG_SERVED_MODEL_NAME`: served model name reported by SGLang
-- `SGLANG_TP_SIZE`: tensor parallel size inside each replica
-- `SGLANG_CONTEXT_LENGTH`: must be large enough for your OPD token sequences
-- `SGLANG_API_KEY`: bearer token required by `/generate`
-- `SGLANG_EXTRA_ARGS`: additional SGLang args, for example `--trust-remote-code`
-- `TEACHER_BASE_URL`: deployed public teacher URL, filled in after deploy
-
-### Recommended Shape For Fixed DP x TP
-
-If you want:
-
-- `n` fixed DP replicas
-- `m` GPUs per replica
-- `TP = m`
-
-then configure:
-
-```env
-MODAL_DP_REPLICAS=n
-MODAL_MIN_CONTAINERS=n
-MODAL_MAX_CONTAINERS=n
-MODAL_GPU_CONFIG=A100:m
-SGLANG_TP_SIZE=m
-```
-
-### Example Config
-
-This is a representative configuration:
-
-```env
-MODAL_APP_NAME=swe-opd-modal-teacher-fixed
-MODAL_REGION=us-east
-MODAL_PROXY_REGIONS=us-east
-
-N=2
-MODAL_DP_REPLICAS=${N}
-MODAL_MIN_CONTAINERS=${N}
-MODAL_MAX_CONTAINERS=${N}
-
-M=2
-MODAL_GPU_CONFIG=A100:${M}
-SGLANG_TP_SIZE=${M}
-
-SGLANG_MODEL_PATH=Qwen/Qwen3-8B
-SGLANG_MODEL_REVISION=
-SGLANG_SERVED_MODEL_NAME=Qwen/Qwen3-8B
-SGLANG_CONTEXT_LENGTH=32000
-SGLANG_API_KEY=replace-me-with-a-real-token
-SGLANG_EXTRA_ARGS=--trust-remote-code
-
-TEACHER_BASE_URL=
-```
-
-## End-To-End Workflow
-
-The normal flow is:
-
-1. prepare config
-2. prefetch model weights into the shared Modal volume
-3. deploy the teacher service
-4. resolve the deployed public URL
-5. write `TEACHER_BASE_URL`
-6. run smoke tests
-
-### Step 1: Check Your Config
+Downloads model into Modal's shared cache volume without starting any GPU replicas:
 
 ```bash
-cd /u/zhe3/re-swe/swe-opd-modal-teacher
-bash scripts/status.sh
-```
-
-Make sure the values printed here are exactly the ones you expect before deploying.
-
-### Step 2: Prefetch The Model
-
-Prefetch downloads model weights into the shared Modal volume without booting the full teacher pool.
-
-```bash
-cd /u/zhe3/re-swe/swe-opd-modal-teacher
 bash scripts/prefetch_model.sh
 ```
 
-Expected success signal:
-
-```text
-Prefetched <model> into /root/.cache/huggingface
-```
-
-Notes:
-
-- this step intentionally forces `MODAL_MIN_CONTAINERS=0` and `MODAL_MAX_CONTAINERS=0`
-- it only fills the shared cache volume
-- it does not start your fixed `n` teacher replicas
-
-### Step 3: Deploy
-
-Deploy the fixed-size service:
+### 4. Deploy
 
 ```bash
-cd /u/zhe3/re-swe/swe-opd-modal-teacher
 bash scripts/deploy.sh
 ```
 
-This runs:
+### 5. Get the public URL
 
 ```bash
-modal deploy modal_app.py
+bash scripts/get_url.sh --save
 ```
 
-### Step 4: Resolve The Public URL
+This resolves the deployed URL and writes it to `TEACHER_BASE_URL` in your local config.
 
-After deploy, fetch the stable public URL with Modal:
+### 6. Verify
 
 ```bash
-cd /u/zhe3/re-swe/swe-opd-modal-teacher
-source config/bootstrap/modal_teacher.local.env
-python - <<'PY'
-import modal
-import os
-
-cls = modal.Cls.from_name(os.environ["MODAL_APP_NAME"], "TeacherServer")
-print(cls().serve.get_web_url())
-PY
+bash scripts/verify.sh
 ```
 
-This should return a URL like:
+Tests config, `/get_model_info`, text-based `/generate`, and OPD-style `input_ids` `/generate`.
 
-```text
-https://...modal.run
-```
+---
 
-Write that into `config/bootstrap/modal_teacher.local.env`:
+## Setup Guide for New Teammates
+
+### What you need
+
+1. **A Modal account** — sign up at https://modal.com (free tier available)
+2. **Python 3.11+** with `modal` and `requests` installed
+3. **Access to the teacher model on HuggingFace** (if it's a gated/private model, you'll need a HF token)
+
+### Step-by-step
+
+1. **Clone this repo**:
+   ```bash
+   git clone git@github.com:twelfth-star/swe-opd-modal-teacher.git
+   cd swe-opd-modal-teacher
+   ```
+
+2. **Install**:
+   ```bash
+   pip install -e .
+   pip install modal
+   ```
+
+3. **Authenticate with Modal**:
+   ```bash
+   modal setup
+   ```
+   This opens a browser for OAuth login. Each person uses their own Modal account.
+
+4. **If the model is private on HuggingFace**, create a Modal secret:
+   ```bash
+   modal secret create huggingface-secret HF_TOKEN=hf_your_token_here
+   ```
+   Then set `MODAL_HF_SECRET_NAME=huggingface-secret` in your config.
+
+5. **Run the setup wizard**:
+   ```bash
+   bash scripts/setup.sh
+   ```
+
+6. **Deploy and test**:
+   ```bash
+   bash scripts/prefetch_model.sh
+   bash scripts/deploy.sh
+   bash scripts/get_url.sh --save
+   bash scripts/verify.sh
+   ```
+
+### What is personal vs shared
+
+| Item | Shared | Personal |
+|------|--------|----------|
+| This repo's code and scripts | shared (git) | — |
+| `modal_teacher.example.env` | shared (git) | — |
+| `modal_teacher.local.env` | — | personal (gitignored) |
+| Modal account & auth | — | personal |
+| Modal app deployment | — | personal (each person deploys their own) |
+| HF model weights | shared (same HF repo) | — |
+
+---
+
+## Configuration Reference
+
+All config lives in `config/bootstrap/modal_teacher.local.env`. The system loads `.local.env` first, falls back to `.env`, and errors if neither exists.
+
+### Preset configs
+
+Several preset configurations are provided as starting points:
+
+| File | Model | GPUs |
+|------|-------|------|
+| `modal_teacher.example.env` | Qwen/Qwen3-8B | 2x A100 (tp=2) |
+| `modal_teacher_qwen35_35b.env` | Qwen/Qwen3.5-35B-A3B-FP8 | 4x A100-40GB (tp=4) |
+| `modal_teacher_qwen3_coder_next.env` | Qwen/Qwen3-30B-A3B-Instruct-2507 | 2x A100-80GB (tp=2) |
+
+Copy any preset to `modal_teacher.local.env` and edit as needed.
+
+### Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| **Modal infrastructure** | | |
+| `MODAL_APP_NAME` | `swe-opd-modal-teacher` | App identifier (must be unique per Modal account) |
+| `MODAL_REGION` | `us-east` | Container region |
+| `MODAL_PROXY_REGIONS` | `us-east` | Proxy region(s) for public endpoint |
+| `MODAL_GPU_CONFIG` | `A100:2` | GPU spec per replica (e.g. `A100-80GB:4`) |
+| `MODAL_DP_REPLICAS` | `2` | Fixed replica count (N) |
+| `MODAL_MIN_CONTAINERS` | same as N | Must equal `MODAL_DP_REPLICAS` |
+| `MODAL_MAX_CONTAINERS` | same as N | Must equal `MODAL_DP_REPLICAS` |
+| `MODAL_TARGET_INPUTS` | `4` | Max concurrent requests per replica |
+| `MODAL_SCALEDOWN_WINDOW_SECONDS` | `1800` | Idle time before scaledown (30 min) |
+| `MODAL_BASE_IMAGE` | SGLang v0.5.6 image | Docker base image |
+| `MODAL_HF_SECRET_NAME` | (empty) | Modal secret for private HF models |
+| `MODAL_HF_CACHE_VOLUME_NAME` | `swe-opd-modal-teacher-hf-cache` | Shared cache volume name |
+| **SGLang server** | | |
+| `SGLANG_MODEL_PATH` | `Qwen/Qwen3-8B` | HuggingFace model ID |
+| `SGLANG_MODEL_REVISION` | (empty) | Pinned model revision |
+| `SGLANG_SERVED_MODEL_NAME` | same as model path | Name in API responses |
+| `SGLANG_TP_SIZE` | `1` | Tensor parallelism (must equal GPU count in `MODAL_GPU_CONFIG`) |
+| `SGLANG_MEM_FRACTION_STATIC` | `0.80` | GPU memory fraction for KV cache |
+| `SGLANG_CONTEXT_LENGTH` | `0` | Max context (0 = model default) |
+| `SGLANG_API_KEY` | `CHANGE_ME` | Bearer token for authentication |
+| `SGLANG_EXTRA_ARGS` | (empty) | Extra SGLang flags (e.g. `--trust-remote-code`) |
+| **Timeouts & warmup** | | |
+| `PREFETCH_TIMEOUT_SECONDS` | `7200` | Model download timeout |
+| `SGLANG_STARTUP_TIMEOUT_SECONDS` | `1800` | Server startup timeout |
+| `SGLANG_ENABLE_WARMUP` | `true` | Run warmup requests after startup |
+| `SGLANG_WARMUP_REPEATS` | `2` | Number of warmup requests |
+| **Deployment state** | | |
+| `TEACHER_BASE_URL` | (empty) | Public endpoint URL (filled after deploy via `get_url.sh`) |
+
+### GPU topology
+
+If you want `N` replicas with `M` GPUs each (TP = M):
 
 ```env
-TEACHER_BASE_URL=https://your-teacher-endpoint.modal.run
+MODAL_DP_REPLICAS=N
+MODAL_MIN_CONTAINERS=N
+MODAL_MAX_CONTAINERS=N
+MODAL_GPU_CONFIG=A100:M
+SGLANG_TP_SIZE=M
 ```
 
-### Step 5: Smoke Test The Deployment
+Total GPUs = N x M.
 
-Run the smoke tests:
+---
+
+## API
+
+The deployed service exposes SGLang's native endpoints. The training code in [swe-opt-training](https://github.com/twelfth-star/swe-opt-training) calls `POST /generate` with `input_ids`.
+
+### POST /generate (OPD usage)
+
+This is the primary endpoint used by the training pipeline.
+
+**Request:**
+```json
+{
+  "input_ids": [14990, 1234, 5678],
+  "sampling_params": {
+    "temperature": 0,
+    "max_new_tokens": 0,
+    "skip_special_tokens": false
+  },
+  "return_logprob": true,
+  "logprob_start_len": 0
+}
+```
+
+**Headers:**
+```
+Content-Type: application/json
+Authorization: Bearer <SGLANG_API_KEY>
+```
+
+**Response** (relevant fields):
+```json
+{
+  "meta_info": {
+    "input_token_logprobs": [
+      [logprob_value, token_id],
+      [logprob_value, token_id],
+      ...
+    ]
+  }
+}
+```
+
+The training code extracts `meta_info.input_token_logprobs` and uses the per-token log-probabilities as the distillation signal.
+
+### GET /get_model_info
+
+Returns model metadata. Used as a health check (more reliable than `/health`).
+
+### Important: do not use /health as readiness check
+
+SGLang's `/health` endpoint is unreliable in this setup — it may return 503 even when `/generate` and `/get_model_info` work fine. Always use `/get_model_info` or `/generate` instead.
+
+---
+
+## Directory Structure
+
+```
+scripts/
+  setup.sh                  # Interactive config wizard
+  verify.sh                 # Smoke test deployed service
+  get_url.sh                # Resolve and save public URL
+  status.sh                 # Print current config summary
+  prefetch_model.sh         # Download model weights (no GPU)
+  deploy.sh                 # Deploy to Modal
+  common.sh                 # Shared shell helpers
+  test_health.sh            # Test /get_model_info + /generate
+  test_generate.sh          # Test text-based /generate
+  test_generate_input_ids.sh  # Test OPD-style input_ids /generate
+
+config/bootstrap/
+  modal_teacher.example.env           # Template config
+  modal_teacher_qwen35_35b.env        # Preset: Qwen3.5-35B on 4x A100
+  modal_teacher_qwen3_coder_next.env  # Preset: Qwen3-30B on 2x A100-80GB
+
+modal_app.py                          # Modal app entrypoint
+swe_opd_modal_teacher/
+  settings.py                         # Environment-backed configuration
+  runtime.py                          # Runtime helpers (health check, warmup)
+```
+
+## Integration with swe-opt-training
+
+The training code calls the teacher via two environment variables:
+
+```env
+SWE_TEACHER_URL=https://your-app.modal.run/generate
+SWE_TEACHER_API_KEY=your-api-key
+```
+
+These are set in the training pipeline's config. The teacher URL should point to `/generate` (not the base URL).
+
+For slime OPD integration, the relevant args are:
 
 ```bash
-cd /u/zhe3/re-swe/swe-opd-modal-teacher
-bash scripts/test_health.sh
-bash scripts/test_generate.sh
-bash scripts/test_generate_input_ids.sh
-```
-
-What each script verifies:
-
-- `test_health.sh`
-  checks authenticated `/get_model_info` and then performs one minimal `/generate` smoke request
-- `test_generate.sh`
-  sends a text-based `/generate` request
-- `test_generate_input_ids.sh`
-  sends an OPD-style `input_ids` request and is the closest local smoke test to what `slime` OPD uses
-
-### Manual Test Examples
-
-Text-based `/generate`:
-
-```bash
-curl -fsS "${TEACHER_BASE_URL%/}/generate" \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer ${SGLANG_API_KEY}" \
-  -d '{
-    "text": "Hello from swe-opd-modal-teacher",
-    "sampling_params": {
-      "temperature": 0,
-      "max_new_tokens": 0,
-      "skip_special_tokens": false
-    },
-    "return_logprob": true,
-    "logprob_start_len": 0
-  }'
-```
-
-OPD-style `input_ids`:
-
-```bash
-curl -fsS "${TEACHER_BASE_URL%/}/generate" \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer ${SGLANG_API_KEY}" \
-  -d '{
-    "input_ids": [14990],
-    "sampling_params": {
-      "temperature": 0,
-      "max_new_tokens": 0,
-      "skip_special_tokens": false
-    },
-    "return_logprob": true,
-    "logprob_start_len": 0
-  }'
-```
-
-## Important Operational Notes
-
-### Do Not Use `/health` Or `/health_generate` As Your Success Criterion
-
-In this setup, SGLang's `/health` and `/health_generate` are not reliable readiness probes.
-They may return `503` even when authenticated `/generate` and `/get_model_info` are working.
-
-Use these as your real success criteria instead:
-
-- authenticated `GET /get_model_info`
-- authenticated `POST /generate`
-
-That is why `scripts/test_health.sh` uses those endpoints rather than `/health`.
-
-### API Key Expectations
-
-This service is expected to run behind bearer auth.
-
-The test scripts automatically send:
-
-```text
-Authorization: Bearer ${SGLANG_API_KEY}
-```
-
-If you change the key in `modal_teacher.local.env`, redeploy the service before testing again.
-
-### Tokenizer Compatibility
-
-For `slime` OPD, the teacher request is sent with `input_ids`, not raw text.
-That means the teacher must use a tokenizer that is compatible with the student rollout tokenizer.
-
-This repo does not enforce tokenizer matching for you.
-It assumes you have already chosen a teacher model whose tokenizer matches the student token ids.
-
-## How To Connect This Teacher To `slime` OPD
-
-This repo only provides the remote teacher service.
-The actual OPD training loop still lives in `slime`.
-
-### What `slime` Expects
-
-`slime` OPD in `sglang` mode expects:
-
-- a remote teacher endpoint at `--rm-url`
-- the teacher endpoint to accept `input_ids`
-- the teacher endpoint to return `meta_info.input_token_logprobs`
-
-That matches this service.
-
-Local code references:
-
-- [`on_policy_distillation.py`](/u/zhe3/re-swe/slime/slime/rollout/on_policy_distillation.py)
-- [`arguments.py`](/u/zhe3/re-swe/slime/slime/utils/arguments.py)
-- [`run-qwen3-8B-opd.sh`](/u/zhe3/re-swe/slime/examples/on_policy_distillation/run-qwen3-8B-opd.sh)
-
-### `slime` Args To Use
-
-You need the standard OPD args:
-
-```bash
+--rm-url "${TEACHER_BASE_URL%/}/generate"
+--rm-api-key "${SGLANG_API_KEY}"
 --use-opd
 --opd-type sglang
 --opd-kl-coef 1.0
---custom-rm-path slime.rollout.on_policy_distillation.reward_func
---custom-reward-post-process-path slime.rollout.on_policy_distillation.post_process_rewards
 ```
-
-And then point `slime` at this deployed teacher:
-
-```bash
---rm-url "${TEACHER_BASE_URL%/}/generate"
---rm-api-key "${SGLANG_API_KEY}"
-```
-
-`slime` in this workspace has been patched to support:
-
-- `--rm-api-key`
-
-That token is sent as:
-
-```text
-Authorization: Bearer <token>
-```
-
-### Minimal Integration Snippet
-
-If you are modifying a `slime` launch script, the reward-model / teacher section should look like this:
-
-```bash
-RM_ARGS=(
-  --custom-rm-path slime.rollout.on_policy_distillation.reward_func
-  --custom-reward-post-process-path slime.rollout.on_policy_distillation.post_process_rewards
-  --rm-url "${TEACHER_BASE_URL%/}/generate"
-  --rm-api-key "${SGLANG_API_KEY}"
-)
-
-GRPO_ARGS=(
-  --advantage-estimator grpo
-  --use-opd
-  --opd-type sglang
-  --opd-kl-coef 1.0
-  --use-kl-loss
-  --kl-loss-coef 0.00
-  --kl-loss-type low_var_kl
-  --entropy-coef 0.00
-)
-```
-
-### Minimal End-To-End `slime` Example
-
-Assuming:
-
-- the teacher service is already deployed
-- `TEACHER_BASE_URL` is the deployed Modal URL
-- `SGLANG_API_KEY` is the bearer token expected by the teacher
-
-then the teacher-specific OPD args are:
-
-```bash
---custom-rm-path slime.rollout.on_policy_distillation.reward_func \
---custom-reward-post-process-path slime.rollout.on_policy_distillation.post_process_rewards \
---rm-url "${TEACHER_BASE_URL%/}/generate" \
---rm-api-key "${SGLANG_API_KEY}" \
---use-opd \
---opd-type sglang \
---opd-kl-coef 1.0
-```
-
-### Important `slime` Notes
-
-- do not use `--opd-teacher-load` when `--opd-type sglang`
-- the remote teacher URL should point to `/generate`
-- the teacher must support `input_ids`
-- the teacher must return token logprobs
-- the teacher and student tokenizers must be compatible
 
 ## Troubleshooting
 
-### `test_health.sh` Fails With `401`
+**401 Unauthorized** — API key mismatch. Check `SGLANG_API_KEY` in your local.env matches what was deployed. Redeploy after fixing.
 
-This means the local `SGLANG_API_KEY` and the deployed service key do not match.
+**503 Service Unavailable** — Service may still be starting, or you're hitting `/health` instead of `/get_model_info`. Wait a few minutes and retry with `bash scripts/verify.sh`.
 
-Fix:
+**Config changes not reflected** — You must redeploy after editing local.env: `bash scripts/deploy.sh`.
 
-1. check `config/bootstrap/modal_teacher.local.env`
-2. confirm `SGLANG_API_KEY`
-3. redeploy with `bash scripts/deploy.sh`
-4. rerun the smoke tests
+**Prefetch downloads too slowly** — Make sure `hf_transfer` is working (it's installed automatically in the container image).
 
-### `test_health.sh` Or `test_generate.sh` Fails With `503`
-
-Possible causes:
-
-- the service has not finished starting yet
-- the wrong URL is in `TEACHER_BASE_URL`
-- you are checking `/health` instead of `/get_model_info` or `/generate`
-
-Use:
-
-```bash
-bash scripts/test_health.sh
-```
-
-instead of curling `/health` directly.
-
-### You Changed Env But Modal Still Uses Old Values
-
-This usually means you edited `modal_teacher.local.env` but have not redeployed yet.
-
-Fix:
-
-```bash
-bash scripts/deploy.sh
-```
-
-The deployed service only reflects the new config after redeploy.
-
-### Prefetch Starts The Whole Teacher Pool
-
-That should not happen anymore.
-`scripts/prefetch_model.sh` explicitly forces:
-
-- `MODAL_MIN_CONTAINERS=0`
-- `MODAL_MAX_CONTAINERS=0`
-
-so prefetch only fills the shared cache volume.
-
-## Summary
-
-If you only want the shortest working sequence:
-
-```bash
-cd /u/zhe3/re-swe/swe-opd-modal-teacher
-cp config/bootstrap/modal_teacher.example.env config/bootstrap/modal_teacher.local.env
-vim config/bootstrap/modal_teacher.local.env
-bash scripts/status.sh
-bash scripts/prefetch_model.sh
-bash scripts/deploy.sh
-source config/bootstrap/modal_teacher.local.env
-python - <<'PY'
-import modal
-import os
-cls = modal.Cls.from_name(os.environ["MODAL_APP_NAME"], "TeacherServer")
-print(cls().serve.get_web_url())
-PY
-# write the output into TEACHER_BASE_URL
-bash scripts/test_health.sh
-bash scripts/test_generate.sh
-bash scripts/test_generate_input_ids.sh
-```
-
-Then point `slime` OPD at:
-
-```bash
---rm-url "${TEACHER_BASE_URL%/}/generate"
---rm-api-key "${SGLANG_API_KEY}"
-```
+**GPU cost** — Modal charges per second of GPU usage. Stop your deployment when not in use by scaling to zero or deleting the app: `modal app stop <app-name>`.

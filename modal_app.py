@@ -14,6 +14,8 @@ HF_CACHE_VOL = modal.Volume.from_name(settings.modal_hf_cache_volume_name, creat
 image = (
     modal.Image.from_registry(settings.modal_base_image)
     .entrypoint([])
+    # hf_transfer for fast model weight downloads
+    .pip_install("hf_transfer")
     .add_local_dir(
         Path(__file__).resolve().parent / "swe_opd_modal_teacher",
         remote_path="/root/swe_opd_modal_teacher",

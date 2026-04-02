@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+#
+# Interactive setup wizard for swe-opd-modal-teacher.
+# Generates config/bootstrap/modal_teacher.local.env from user input.
+#
+# Usage:
+#   bash scripts/setup.sh          # interactive mode
+#   bash scripts/setup.sh --check  # validate existing config
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+CONFIG_DIR="${PROJECT_ROOT}/config/bootstrap"
+
+# ── Helpers ──────────────────────────────────────────────────────────
+
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+info()  { printf "${GREEN}[OK]${NC}   %s\n" "$*"; }
+warn()  { printf "${YELLOW}[WARN]${NC} %s\n" "$*"; }
+err()   { printf "${RED}[ERR]${NC}  %s\n" "$*"; }
+header(){ printf "\n${BOLD}── %s ──${NC}\n\n" "$*"; }
+
+ask() {
+    local var_name="$1" prompt="$2" default="${3:-}"
+    if [[ -n "${default}" ]]; then
+        printf "  %s [%s]: " "${prompt}" "${default}"
+    else
+        printf "  %s: " "${prompt}"
+    fi
+    read -r value
+    value="${value:-${default}}"
+    eval "${var_name}=\"\${value}\""
+}
+
+write_env() {
+    local file="$1"
+    shift
+    mkdir -p "$(dirname "${file}")"
+    printf '' > "${file}"
+    for line in "$@"; do
+        printf '%s\n' "${line}" >> "${file}"
+    done
+    info "Wrote ${file}"
+}
+
+# ── --check mode ─────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "--check" ]]; then
+    header "Checking configuration"
+    f="${CONFIG_DIR}/modal_teacher.local.env"
+    if [[ -f "${f}" ]]; then
+        info "modal_teacher.local.env exists"
+    else
+        err "modal_teacher.local.env missing — run 'bash scripts/setup.sh' to create"
+        exit 1
+    fi
+
+    # Check Modal CLI
+    if command -v modal &>/dev/null; then
+        info "Modal CLI found: $(command -v modal)"
+    else
+        warn "Modal CLI not found. Install with: pip install modal"
+    fi
+
+    # Check Modal auth
+    if modal profile current &>/dev/null; then
+        info "Modal profile active"
+    else
+        warn "No Modal profile — run: modal setup"
+    fi
+    exit 0
+fi
+
+# ── Interactive setup ────────────────────────────────────────────────
+
+printf "\n${BOLD}swe-opd-modal-teacher — Interactive Setup${NC}\n"
+printf "This will create config/bootstrap/modal_teacher.local.env.\n"
+printf "Press Enter to accept defaults shown in [brackets].\n"
+
+# ── 1. Modal account ────────────────────────────────────────────────
+
+header "1/4  Modal account"
+
+if command -v modal &>/dev/null; then
+    info "Modal CLI found"
+else
+    err "Modal CLI not found. Install with: pip install modal"
+    printf "  After installing, run: modal setup\n"
+    printf "  Then re-run this wizard.\n"
+    exit 1
+fi
+
+if modal profile current &>/dev/null; then
+    info "Modal profile active"
+else
+    warn "No Modal profile configured."
+    printf "  Run 'modal setup' to authenticate, then re-run this wizard.\n"
+    exit 1
+fi
+
+ask APP_NAME    "Modal app name (unique per deployment)" "swe-opd-modal-teacher"
+ask REGION      "Modal region" "us-east"
+
+# ── 2. Model ─────────────────────────────────────────────────────────
+
+header "2/4  Teacher model"
+
+ask MODEL_PATH  "HuggingFace model ID" "Qwen/Qwen3-8B"
+ask MODEL_NAME  "Served model name" "${MODEL_PATH}"
+ask MODEL_REV   "Model revision (leave empty for latest)" ""
+ask API_KEY     "API key for bearer auth" "swe-opd-teacher-key-$(date +%Y)"
+
+# ── 3. GPU topology ─────────────────────────────────────────────────
+
+header "3/4  GPU topology"
+
+printf "  Each replica gets M GPUs and runs SGLang with TP=M.\n"
+printf "  N replicas = N independent inference servers (data parallelism).\n\n"
+
+ask GPU_TYPE    "GPU type (A100 / A100-80GB / H100 / etc.)" "A100-80GB"
+ask GPU_COUNT   "GPUs per replica (M, also TP size)" "2"
+ask REPLICAS    "Number of replicas (N)" "1"
+
+GPU_CONFIG="${GPU_TYPE}:${GPU_COUNT}"
+
+ask TARGET_INPUTS "Max concurrent requests per replica" "4"
+ask MEM_FRACTION  "GPU memory fraction for KV cache" "0.80"
+ask CTX_LEN       "Context length (0 = model default)" "0"
+ask EXTRA_ARGS    "Extra SGLang args (e.g. --trust-remote-code)" "--trust-remote-code"
+
+# ── 4. Optional settings ────────────────────────────────────────────
+
+header "4/4  Optional settings"
+
+ask BASE_IMAGE    "SGLang Docker image" "lmsysorg/sglang:v0.5.6.post2-cu129-amd64-runtime"
+ask HF_SECRET     "Modal HF secret name (leave empty if model is public)" ""
+ask CACHE_VOL     "Modal HF cache volume name" "swe-opd-modal-teacher-hf-cache"
+ask WARMUP        "Enable warmup after startup? (true/false)" "true"
+
+# ── Write config ─────────────────────────────────────────────────────
+
+header "Writing config"
+
+HF_SECRET_LINE="# MODAL_HF_SECRET_NAME="
+if [[ -n "${HF_SECRET}" ]]; then
+    HF_SECRET_LINE="MODAL_HF_SECRET_NAME=${HF_SECRET}"
+fi
+
+write_env "${CONFIG_DIR}/modal_teacher.local.env" \
+    "# Auto-generated by scripts/setup.sh" \
+    "" \
+    "# Modal app identity and placement." \
+    "MODAL_APP_NAME=${APP_NAME}" \
+    "MODAL_REGION=${REGION}" \
+    "MODAL_PROXY_REGIONS=${REGION}" \
+    "" \
+    "# Fixed deployment size: ${REPLICAS} replica(s) x ${GPU_COUNT} GPU(s)." \
+    "MODAL_DP_REPLICAS=${REPLICAS}" \
+    "MODAL_MIN_CONTAINERS=${REPLICAS}" \
+    "MODAL_MAX_CONTAINERS=${REPLICAS}" \
+    "" \
+    "# Per-container GPU request." \
+    "MODAL_GPU_CONFIG=${GPU_CONFIG}" \
+    "SGLANG_TP_SIZE=${GPU_COUNT}" \
+    "" \
+    "# Concurrency." \
+    "MODAL_TARGET_INPUTS=${TARGET_INPUTS}" \
+    "MODAL_SCALEDOWN_WINDOW_SECONDS=1800" \
+    "MODAL_EXIT_GRACE_PERIOD_SECONDS=25" \
+    "" \
+    "# Base image and HuggingFace cache." \
+    "MODAL_BASE_IMAGE=${BASE_IMAGE}" \
+    "${HF_SECRET_LINE}" \
+    "MODAL_HF_CACHE_VOLUME_NAME=${CACHE_VOL}" \
+    "HF_CACHE_PATH=/root/.cache/huggingface" \
+    "HF_HOME_PATH=/root/.cache/huggingface" \
+    "" \
+    "# SGLang server settings." \
+    "SGLANG_MODEL_PATH=${MODEL_PATH}" \
+    "SGLANG_MODEL_REVISION=${MODEL_REV}" \
+    "SGLANG_SERVED_MODEL_NAME=${MODEL_NAME}" \
+    "SGLANG_HOST=0.0.0.0" \
+    "SGLANG_PORT=8000" \
+    "SGLANG_MEM_FRACTION_STATIC=${MEM_FRACTION}" \
+    "SGLANG_CONTEXT_LENGTH=${CTX_LEN}" \
+    "SGLANG_API_KEY=${API_KEY}" \
+    "SGLANG_EXTRA_ARGS=${EXTRA_ARGS}" \
+    "" \
+    "# Startup and warmup." \
+    "PREFETCH_TIMEOUT_SECONDS=7200" \
+    "SGLANG_STARTUP_TIMEOUT_SECONDS=1800" \
+    "SGLANG_ENABLE_WARMUP=${WARMUP}" \
+    "SGLANG_WARMUP_REPEATS=2" \
+    "SGLANG_WARMUP_MAX_TOKENS=8" \
+    "" \
+    "# Filled after deployment — run scripts/get_url.sh" \
+    "TEACHER_BASE_URL="
+
+# ── Done ─────────────────────────────────────────────────────────────
+
+header "Setup complete"
+printf "Next steps:\n"
+printf "  1. Review: bash scripts/status.sh\n"
+printf "  2. Prefetch model weights: bash scripts/prefetch_model.sh\n"
+printf "  3. Deploy: bash scripts/deploy.sh\n"
+printf "  4. Get the public URL: bash scripts/get_url.sh\n"
+printf "  5. Test: bash scripts/verify.sh\n"
+printf "\n"
